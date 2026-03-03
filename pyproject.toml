@@ -1,0 +1,16 @@
+[project]
+name = "neurovlm-cns"
+version = "0.1.0"
+description = "CNS 2026 abstract-map assets and reproducible HTML rebuild tooling."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "neurovlm @ git+https://github.com/neurovlm/neurovlm.git",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = []

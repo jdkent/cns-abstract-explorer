@@ -1,0 +1,16 @@
+# Python cache and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+
+# Local virtual environments if created inside this project later
+.venv/
+
+# Generated local outputs are reproducible and should stay out of git
+output/
+
+# Keep the GitHub Pages deliverable, but ignore reproducible bundle internals
+docs/cns_2026_map/code/
+docs/cns_2026_map/data/
