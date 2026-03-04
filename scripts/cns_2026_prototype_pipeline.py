@@ -7,22 +7,21 @@ import argparse
 import base64
 import json
 import logging
-import math
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Iterable
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import numpy as np
 import pandas as pd
 import torch
 import matplotlib
-from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 from umap import UMAP
@@ -31,9 +30,9 @@ matplotlib.use("Agg")
 
 import hdbscan
 from nilearn import plotting
+from build_cns_2026_html import build_graph_html as html_build_graph, publish_bundle as publish_html_bundle
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE_ROOT = PROJECT_ROOT.parent
 PDF_PATH = PROJECT_ROOT / "CNS_2026_Abstracts.pdf"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 CACHE_DIR = OUTPUT_DIR / "cache" / "cns_2026_prototype"
@@ -41,24 +40,18 @@ SCRIPT_LOG = CACHE_DIR / "pipeline.log"
 PARSED_CSV = CACHE_DIR / "parsed_abstracts.csv"
 SPECTER_MODEL_ID = "allenai/specter2_aug2023refresh_base"
 SAMPLE_SEED = 42
+DOTENV_PATH = PROJECT_ROOT / ".env"
+DEFAULT_CLUSTER_LABEL_MODEL = "gpt-4o-mini"
 
 try:
     from neurovlm.data import load_masker  # noqa: E402
     from neurovlm.models import load_model as load_neurovlm_model  # noqa: E402
-except ModuleNotFoundError:
-    for neurovlm_src in (PROJECT_ROOT / "neurovlm" / "src", WORKSPACE_ROOT / "neurovlm" / "src"):
-        if neurovlm_src.exists():
-            sys.path.insert(0, str(neurovlm_src))
-            break
-    else:
-        raise FileNotFoundError(
-            "Could not import the installed `neurovlm` package and could not locate a source checkout. "
-            "Expected either an environment install or one of "
-            f"{PROJECT_ROOT / 'neurovlm' / 'src'} / {WORKSPACE_ROOT / 'neurovlm' / 'src'}."
-        )
-
-    from neurovlm.data import load_masker  # noqa: E402
-    from neurovlm.models import load_model as load_neurovlm_model  # noqa: E402
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        "Could not import `neurovlm`. Install the GitHub package into this project's environment, "
+        "for example with `uv pip install --python .venv/bin/python "
+        "git+https://github.com/neurovlm/neurovlm.git`."
+    ) from exc
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,7 +68,7 @@ def parse_args() -> argparse.Namespace:
         "--batch-size",
         type=int,
         default=8,
-        help="Batch size for SPECTER inference. Lower this if RAM is tight.",
+        help="Batch size for text embedding inference. Lower this if RAM is tight.",
     )
     parser.add_argument(
         "--chunk-words",
@@ -88,6 +81,39 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=max(1, min(4, (os.cpu_count() or 2) // 2)),
         help="Parallel workers used only for rendering PNG brainmap previews.",
+    )
+    parser.add_argument(
+        "--cluster-embedding-space",
+        choices=("specter", "neurovlm"),
+        default="specter",
+        help=(
+            "Embedding space used for UMAP + clustering. "
+            "`neurovlm` uses the 384-d NeuroVLM projected text space (`proj_head_text_mse`)."
+        ),
+    )
+    parser.add_argument(
+        "--umap-n-neighbors",
+        type=int,
+        default=None,
+        help="Override UMAP n_neighbors for clustering. Defaults are chosen per embedding space.",
+    )
+    parser.add_argument(
+        "--umap-min-dist",
+        type=float,
+        default=None,
+        help="Override UMAP min_dist for clustering. Defaults are chosen per embedding space.",
+    )
+    parser.add_argument(
+        "--hdbscan-min-cluster-size",
+        type=int,
+        default=None,
+        help="Override HDBSCAN min_cluster_size. Defaults are chosen per embedding space.",
+    )
+    parser.add_argument(
+        "--hdbscan-min-samples",
+        type=int,
+        default=None,
+        help="Override HDBSCAN min_samples. Defaults are chosen per embedding space.",
     )
     parser.add_argument("--force", action="store_true", help="Recompute cached artifacts.")
     return parser.parse_args()
@@ -633,90 +659,369 @@ def encode_png(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
-def cluster_embeddings(specter_embeddings: np.ndarray, logger: logging.Logger) -> tuple[np.ndarray, np.ndarray]:
-    count = specter_embeddings.shape[0]
+def load_dotenv(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def cluster_name_fallback(cluster_id: int) -> str:
+    if cluster_id < 0:
+        return "Uncategorized"
+    return f"Cluster {cluster_id}"
+
+
+def normalize_cluster_name(raw_text: str, cluster_id: int) -> str:
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if not lines:
+        return cluster_name_fallback(cluster_id)
+    candidate = lines[0]
+    candidate = re.sub(r"^(?:[-*]|\d+[.):-])\s*", "", candidate)
+    candidate = re.sub(r"^cluster\s+\d+\s*[:.-]\s*", "", candidate, flags=re.IGNORECASE)
+    candidate = candidate.strip(" \t\r\n\"'`.,;:-")
+    candidate = re.sub(r"\s+", " ", candidate)
+    if not candidate:
+        return cluster_name_fallback(cluster_id)
+    words = candidate.split()
+    if len(words) > 3:
+        candidate = " ".join(words[:3])
+    return candidate
+
+
+def extract_openai_message_content(body: dict[str, Any]) -> str:
+    choices = body.get("choices", [])
+    if not choices:
+        return ""
+    message = choices[0].get("message", {})
+    return str(message.get("content", ""))
+
+
+def openai_chat_completion(
+    *,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+) -> dict[str, Any] | None:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+    }
+    request = urllib_request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib_request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def parse_json_object(raw_text: str) -> dict[str, Any] | None:
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def request_cluster_name(
+    cluster_id: int,
+    titles: list[str],
+    api_key: str,
+    model: str,
+    logger: logging.Logger,
+) -> str:
+    prompt_titles = "\n".join(f"- {title}" for title in titles)
+    try:
+        body = openai_chat_completion(
+            api_key=api_key,
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a professional neuroscientist who is fantastic at seeing patterns "
+                        "in neuroscientific text."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Below are all abstract titles from one cluster in a neuroscience poster map.\n"
+                        "Return only 1-3 words that best represent the shared theme across these titles.\n"
+                        "Do not include numbering, punctuation, or any explanation.\n\n"
+                        f"{prompt_titles}"
+                    ),
+                },
+            ],
+            max_tokens=12,
+        )
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        logger.warning("OpenAI cluster naming failed for cluster %s: %s", cluster_id, detail)
+        return cluster_name_fallback(cluster_id)
+    except urllib_error.URLError as exc:
+        logger.warning("OpenAI cluster naming failed for cluster %s: %s", cluster_id, exc)
+        return cluster_name_fallback(cluster_id)
+
+    if body is None:
+        return cluster_name_fallback(cluster_id)
+    content = extract_openai_message_content(body)
+    name = normalize_cluster_name(content, cluster_id)
+    logger.info("Named cluster %s as %s", cluster_id, name)
+    return name
+
+
+def resolve_duplicate_cluster_names(
+    cluster_names: dict[int, str],
+    titles_by_cluster: dict[int, list[str]],
+    api_key: str,
+    model: str,
+    logger: logging.Logger,
+) -> dict[int, str]:
+    duplicate_groups: dict[str, list[int]] = {}
+    for cluster_id, name in cluster_names.items():
+        duplicate_groups.setdefault(name, []).append(cluster_id)
+
+    for duplicate_name, cluster_ids in sorted(duplicate_groups.items()):
+        if len(cluster_ids) < 2:
+            continue
+        prompt_sections = []
+        for cluster_id in sorted(cluster_ids):
+            titles = titles_by_cluster.get(cluster_id, [])
+            title_lines = "\n".join(f"- {title}" for title in titles)
+            prompt_sections.append(f"Cluster {cluster_id} titles:\n{title_lines}")
+        prompt_text = "\n\n".join(prompt_sections)
+        try:
+            body = openai_chat_completion(
+                api_key=api_key,
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a professional neuroscientist who is fantastic at seeing patterns "
+                            "in neuroscientific text and differentiating closely related topics."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "These clusters were previously given the same label, but they need distinct names.\n"
+                            "For each cluster below, generate a different 1-3 word label that best matches that "
+                            "cluster's titles while clearly distinguishing it from the others in this request.\n"
+                            "Return JSON only as an object mapping cluster ids to labels, for example "
+                            '{"3":"Working Memory","11":"Task Switching"}.\n'
+                            "Do not include explanation text.\n\n"
+                            f"{prompt_text}"
+                        ),
+                    },
+                ],
+                max_tokens=80,
+            )
+        except urllib_error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            logger.warning(
+                "OpenAI duplicate-name resolution failed for %s (%s): %s",
+                cluster_ids,
+                duplicate_name,
+                detail,
+            )
+            continue
+        except urllib_error.URLError as exc:
+            logger.warning(
+                "OpenAI duplicate-name resolution failed for %s (%s): %s",
+                cluster_ids,
+                duplicate_name,
+                exc,
+            )
+            continue
+
+        if body is None:
+            continue
+        parsed = parse_json_object(extract_openai_message_content(body))
+        if not parsed:
+            logger.warning(
+                "OpenAI duplicate-name resolution returned non-JSON for %s (%s).",
+                cluster_ids,
+                duplicate_name,
+            )
+            continue
+
+        seen_names: set[str] = set()
+        updated_any = False
+        for cluster_id in sorted(cluster_ids):
+            raw_name = parsed.get(str(cluster_id), parsed.get(cluster_id))
+            if raw_name is None:
+                continue
+            normalized = normalize_cluster_name(str(raw_name), cluster_id)
+            if normalized in seen_names:
+                normalized = normalize_cluster_name(f"{normalized} {cluster_id}", cluster_id)
+            seen_names.add(normalized)
+            cluster_names[cluster_id] = normalized
+            updated_any = True
+
+        if updated_any:
+            logger.info(
+                "Resolved duplicate cluster name %s for clusters %s -> %s",
+                duplicate_name,
+                cluster_ids,
+                {cluster_id: cluster_names[cluster_id] for cluster_id in sorted(cluster_ids)},
+            )
+    return cluster_names
+
+
+def generate_cluster_names(sample_df: pd.DataFrame, labels: np.ndarray, logger: logging.Logger) -> dict[int, str]:
+    cluster_ids = sorted({int(label) for label in labels.tolist() if int(label) >= 0})
+    if not cluster_ids:
+        return {}
+
+    env_values = load_dotenv(DOTENV_PATH)
+    api_key = os.environ.get("OPENAI_API_KEY") or env_values.get("OPENAI_API_KEY", "")
+    if not api_key:
+        logger.warning("No OPENAI_API_KEY found in environment or %s; using fallback cluster names.", DOTENV_PATH)
+        return {}
+    model = os.environ.get("OPENAI_CLUSTER_LABEL_MODEL") or env_values.get(
+        "OPENAI_CLUSTER_LABEL_MODEL",
+        DEFAULT_CLUSTER_LABEL_MODEL,
+    )
+
+    titles_by_cluster = {
+        cluster_id: sample_df.loc[labels == cluster_id, "title"].astype(str).tolist()
+        for cluster_id in cluster_ids
+    }
+    cluster_names: dict[int, str] = {}
+    for cluster_id in cluster_ids:
+        titles = titles_by_cluster.get(cluster_id, [])
+        if not titles:
+            continue
+        cluster_names[cluster_id] = request_cluster_name(
+            cluster_id=cluster_id,
+            titles=titles,
+            api_key=api_key,
+            model=model,
+            logger=logger,
+        )
+    return resolve_duplicate_cluster_names(
+        cluster_names=cluster_names,
+        titles_by_cluster=titles_by_cluster,
+        api_key=api_key,
+        model=model,
+        logger=logger,
+    )
+
+
+def resolve_cluster_params(
+    count: int,
+    embedding_space: str,
+    args: argparse.Namespace,
+) -> dict[str, int | float | None]:
+    default_min_cluster_size = max(3, min(8, count // 8 if count >= 8 else 3))
+    if embedding_space == "neurovlm":
+        neurovlm_n_neighbors = min(60, max(10, count // 2), max(2, count - 1))
+        neurovlm_min_cluster_size = min(13, max(4, count // 8), max(4, count - 1))
+        defaults: dict[str, int | float | None] = {
+            "umap_n_neighbors": neurovlm_n_neighbors,
+            "umap_min_dist": 0.02,
+            "hdbscan_min_cluster_size": neurovlm_min_cluster_size,
+            "hdbscan_min_samples": 1,
+        }
+    else:
+        defaults = {
+            "umap_n_neighbors": max(2, min(15, count - 1)),
+            "umap_min_dist": 0.15,
+            "hdbscan_min_cluster_size": default_min_cluster_size,
+            "hdbscan_min_samples": None,
+        }
+
+    if args.umap_n_neighbors is not None:
+        defaults["umap_n_neighbors"] = max(2, min(args.umap_n_neighbors, max(2, count - 1)))
+    if args.umap_min_dist is not None:
+        defaults["umap_min_dist"] = args.umap_min_dist
+    if args.hdbscan_min_cluster_size is not None:
+        defaults["hdbscan_min_cluster_size"] = args.hdbscan_min_cluster_size
+    if args.hdbscan_min_samples is not None:
+        defaults["hdbscan_min_samples"] = args.hdbscan_min_samples
+    return defaults
+
+
+def cluster_embeddings(
+    text_embeddings: np.ndarray,
+    embedding_space: str,
+    logger: logging.Logger,
+    cluster_params: dict[str, int | float | None],
+) -> tuple[np.ndarray, np.ndarray]:
+    count = text_embeddings.shape[0]
     if count < 5:
         coords = np.zeros((count, 2), dtype=np.float32)
         if count:
-            coords[:, 0] = specter_embeddings[:, 0]
-            if specter_embeddings.shape[1] > 1:
-                coords[:, 1] = specter_embeddings[:, 1]
+            coords[:, 0] = text_embeddings[:, 0]
+            if text_embeddings.shape[1] > 1:
+                coords[:, 1] = text_embeddings[:, 1]
         labels = np.full(count, -1, dtype=np.int32)
         return coords, labels
-    n_neighbors = max(2, min(15, count - 1))
-    logger.info("UMAP n_neighbors=%s for %s items", n_neighbors, count)
+    n_neighbors = int(cluster_params["umap_n_neighbors"])
+    min_dist = float(cluster_params["umap_min_dist"])
+    min_cluster_size = int(cluster_params["hdbscan_min_cluster_size"])
+    min_samples = cluster_params["hdbscan_min_samples"]
+    logger.info(
+        "Clustering params: space=%s n_neighbors=%s min_dist=%.3f min_cluster_size=%s min_samples=%s",
+        embedding_space,
+        n_neighbors,
+        min_dist,
+        min_cluster_size,
+        min_samples,
+    )
     reducer = UMAP(
         n_neighbors=n_neighbors,
-        min_dist=0.15,
+        min_dist=min_dist,
         metric="cosine",
         random_state=SAMPLE_SEED,
         transform_seed=SAMPLE_SEED,
         init="random",
     )
-    umap_coords = reducer.fit_transform(specter_embeddings)
+    umap_coords = reducer.fit_transform(text_embeddings)
 
-    min_cluster_size = max(3, min(8, count // 8 if count >= 8 else 3))
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, metric="euclidean")
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        metric="euclidean",
+    )
     labels = clusterer.fit_predict(umap_coords)
     return umap_coords.astype(np.float32), labels.astype(np.int32)
-
-
-def build_edges(coords: np.ndarray) -> list[dict[str, Any]]:
-    if len(coords) < 2:
-        return []
-    neighbors = min(4, len(coords))
-    nn = NearestNeighbors(n_neighbors=neighbors, metric="euclidean")
-    nn.fit(coords)
-    distances, indices = nn.kneighbors(coords)
-    seen: set[tuple[int, int]] = set()
-    edges: list[dict[str, Any]] = []
-    for src_idx, (dist_row, idx_row) in enumerate(zip(distances, indices, strict=True)):
-        for distance, dst_idx in zip(dist_row[1:], idx_row[1:], strict=True):
-            a, b = sorted((int(src_idx), int(dst_idx)))
-            if a == b or (a, b) in seen:
-                continue
-            seen.add((a, b))
-            edges.append({"source": a, "target": b, "distance": float(distance)})
-    return edges
-
-
-def scaled_coordinates(coords: np.ndarray, width: int, height: int, padding: int = 56) -> np.ndarray:
-    x = coords[:, 0]
-    y = coords[:, 1]
-    x_span = max(float(x.max() - x.min()), 1e-6)
-    y_span = max(float(y.max() - y.min()), 1e-6)
-    scaled = np.zeros_like(coords, dtype=np.float32)
-    scaled[:, 0] = padding + ((x - x.min()) / x_span) * (width - (padding * 2))
-    scaled[:, 1] = padding + ((y - y.min()) / y_span) * (height - (padding * 2))
-    return scaled
-
-
-def cluster_color(label: int) -> str:
-    palette = [
-        "#1f4e79",
-        "#b85c38",
-        "#4f772d",
-        "#6d597a",
-        "#8d0801",
-        "#355070",
-        "#6b705c",
-        "#9a6d38",
-        "#2c7da0",
-        "#7f5539",
-        "#3a5a40",
-        "#7b2cbf",
-        "#a44a3f",
-        "#006d77",
-        "#7f4f24",
-        "#5c677d",
-        "#8a5a44",
-        "#386641",
-        "#5f0f40",
-        "#4d6c8a",
-    ]
-    if label < 0:
-        return "#9c8f7a"
-    return palette[label % len(palette)]
 
 
 def build_graph_html(
@@ -725,901 +1030,36 @@ def build_graph_html(
     labels: np.ndarray,
     brainmaps_b64: dict[str, str],
     output_path: Path,
+    embedding_space: str,
+    cluster_names: dict[int, str] | None = None,
 ) -> None:
-    width = 1180
-    height = 760
-    graph_coords = scaled_coordinates(coords, width=width, height=height)
-    edges = build_edges(coords)
-
-    nodes: list[dict[str, Any]] = []
-    for idx, row in enumerate(sample_df.itertuples(index=False)):
-        label = int(labels[idx])
-        poster = str(row.poster_number)
-        nodes.append(
+    rows: list[dict[str, str]] = []
+    for row in sample_df.itertuples(index=False):
+        topic_area = getattr(row, "topic_area", "")
+        if pd.isna(topic_area):
+            topic_area = ""
+        rows.append(
             {
-                "id": idx,
-                "poster_number": poster,
+                "poster_number": str(row.poster_number),
                 "title": str(row.title),
                 "authors": str(row.authors),
                 "abstract": str(row.abstract),
-                "topic_area": str(getattr(row, "topic_area", "")),
-                "cluster": label,
-                "cluster_name": "Uncategorized" if label < 0 else f"Cluster {label}",
-                "x": round(float(graph_coords[idx, 0]), 2),
-                "y": round(float(graph_coords[idx, 1]), 2),
-                "color": cluster_color(label),
-                "brainmap_data_url": f"data:image/png;base64,{brainmaps_b64[poster]}",
+                "topic_area": str(topic_area),
             }
         )
-
-    cluster_counts = pd.Series(labels).value_counts().sort_index()
-    summary = {
-        "sample_size": len(sample_df),
-        "clusters": int(sum(cluster_counts.index >= 0)),
-        "noise_points": int(cluster_counts.get(-1, 0)),
+    brainmap_urls = {
+        poster_number: f"data:image/png;base64,{encoded}"
+        for poster_number, encoded in brainmaps_b64.items()
     }
-    legend = [
-        {
-            "cluster_id": int(cluster_id),
-            "label": "Uncategorized" if int(cluster_id) < 0 else f"Cluster {int(cluster_id)}",
-            "count": int(count),
-            "color": cluster_color(int(cluster_id)),
-        }
-        for cluster_id, count in cluster_counts.items()
-    ]
-
-    nodes_json = json.dumps(nodes)
-    edges_json = json.dumps(edges)
-    legend_json = json.dumps(legend)
-    summary_json = json.dumps(summary)
-
-    html_text = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CNS 2026 Prototype Abstract Map (Satire)</title>
-  <style>
-    :root {{
-      --ink: #1f1f1f;
-      --muted: #5f5f5f;
-      --paper: #f7f3eb;
-      --panel: rgba(255, 255, 255, 0.92);
-      --line: rgba(31, 31, 31, 0.12);
-      --shadow: 0 18px 42px rgba(34, 34, 34, 0.09);
-      --accent: #9f3a22;
-      --accent-soft: rgba(159, 58, 34, 0.1);
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      font-family: "Libre Franklin", "Avenir Next", "Segoe UI", sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at 12% 8%, rgba(159, 58, 34, 0.08), transparent 28%),
-        radial-gradient(circle at 88% 16%, rgba(31, 78, 121, 0.08), transparent 24%),
-        linear-gradient(180deg, #fbf8f2 0%, #eef2f5 100%);
-      min-height: 100vh;
-    }}
-    .shell {{
-      width: min(1380px, calc(100vw - 32px));
-      margin: 16px auto;
-      display: grid;
-      grid-template-columns: minmax(0, 1.55fr) minmax(300px, 0.75fr);
-      gap: 16px;
-    }}
-    .card {{
-      background: var(--panel);
-      border: 1px solid rgba(255, 255, 255, 0.9);
-      border-radius: 22px;
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(10px);
-    }}
-    .stage {{
-      padding: 22px 24px 20px;
-    }}
-    h1 {{
-      margin: 0;
-      font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
-      font-size: clamp(1.8rem, 2.2vw, 2.7rem);
-      line-height: 1.02;
-      letter-spacing: -0.025em;
-    }}
-    .lede {{
-      margin: 12px 0 18px;
-      color: var(--muted);
-      max-width: 64ch;
-      line-height: 1.55;
-      font-size: 1rem;
-    }}
-    .eyebrow {{
-      margin: 0 0 8px;
-      font-size: 0.8rem;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      color: var(--accent);
-      font-weight: 700;
-    }}
-    .deck {{
-      display: grid;
-      gap: 2px;
-      padding-bottom: 14px;
-      border-bottom: 1px solid var(--line);
-      margin-bottom: 16px;
-    }}
-    .chips {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-bottom: 14px;
-    }}
-    .chip {{
-      border-radius: 999px;
-      padding: 8px 12px;
-      font-size: 0.88rem;
-      font-weight: 600;
-      background: rgba(31, 31, 31, 0.05);
-      color: var(--ink);
-    }}
-    .chart-wrap {{
-      position: relative;
-      overflow: hidden;
-      padding: 0 14px 14px;
-    }}
-    .zoom-toolbar {{
-      position: absolute;
-      top: 14px;
-      right: 28px;
-      z-index: 4;
-      display: flex;
-      gap: 8px;
-    }}
-    .zoom-toolbar button {{
-      border: 1px solid rgba(31, 31, 31, 0.12);
-      background: rgba(255, 255, 255, 0.94);
-      color: var(--ink);
-      border-radius: 999px;
-      min-width: 40px;
-      min-height: 40px;
-      padding: 0 12px;
-      font: inherit;
-      font-weight: 700;
-      cursor: pointer;
-      box-shadow: var(--shadow);
-    }}
-    .zoom-toolbar button:focus {{
-      outline: none;
-      border-color: rgba(159, 58, 34, 0.45);
-      box-shadow: 0 0 0 4px var(--accent-soft);
-    }}
-    svg {{
-      display: block;
-      width: 100%;
-      height: auto;
-      border-radius: 18px;
-      background:
-        linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 248, 246, 0.98)),
-        repeating-linear-gradient(90deg, transparent 0, transparent 79px, rgba(31, 31, 31, 0.015) 80px);
-      border: 1px solid rgba(31, 31, 31, 0.08);
-      cursor: grab;
-      user-select: none;
-    }}
-    svg.is-dragging {{
-      cursor: grabbing;
-    }}
-    .controls {{
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 10px;
-      margin-bottom: 16px;
-    }}
-    .search-field {{
-      display: grid;
-      gap: 6px;
-    }}
-    .search-field label {{
-      font-size: 0.78rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      font-weight: 700;
-      color: var(--muted);
-    }}
-    .controls input {{
-      padding: 12px 14px;
-      border-radius: 12px;
-      border: 1px solid rgba(31, 31, 31, 0.12);
-      font: inherit;
-      background: rgba(255, 255, 255, 0.96);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
-    }}
-    .controls input:focus {{
-      outline: none;
-      border-color: rgba(159, 58, 34, 0.45);
-      box-shadow: 0 0 0 4px var(--accent-soft);
-    }}
-    .legend {{
-      display: grid;
-      gap: 10px;
-      padding: 18px 18px 18px;
-    }}
-    .legend-scroll {{
-      max-height: min(48vh, 420px);
-      overflow-y: auto;
-      padding-right: 6px;
-      display: grid;
-      gap: 10px;
-    }}
-    .legend-scroll::-webkit-scrollbar {{
-      width: 10px;
-    }}
-    .legend-scroll::-webkit-scrollbar-thumb {{
-      background: rgba(31, 31, 31, 0.18);
-      border-radius: 999px;
-      border: 2px solid rgba(255, 255, 255, 0.7);
-    }}
-    .legend h2, .detail h2 {{
-      margin: 0 0 10px;
-      font-size: 0.95rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--muted);
-    }}
-    .legend-item {{
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 10px 12px;
-      border-radius: 14px;
-      background: rgba(31, 31, 31, 0.04);
-      border: 1px solid transparent;
-      cursor: pointer;
-      transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
-    }}
-    .legend-item:hover {{
-      background: rgba(31, 31, 31, 0.07);
-    }}
-    .legend-item:focus {{
-      outline: none;
-      border-color: rgba(159, 58, 34, 0.45);
-      box-shadow: 0 0 0 4px var(--accent-soft);
-    }}
-    .legend-item.active {{
-      background: rgba(159, 58, 34, 0.1);
-      border-color: rgba(159, 58, 34, 0.28);
-      transform: translateX(2px);
-    }}
-    .swatch {{
-      width: 13px;
-      height: 13px;
-      border-radius: 999px;
-      flex: none;
-    }}
-    .detail {{
-      padding: 18px 18px 20px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }}
-    .detail-card {{
-      border-radius: 18px;
-      padding: 16px;
-      background: rgba(31, 31, 31, 0.04);
-      height: min(72vh, 760px);
-      overflow-y: auto;
-    }}
-    .detail-meta {{
-      margin: 0 0 8px;
-      color: var(--muted);
-      font-size: 0.92rem;
-    }}
-    .detail-title {{
-      margin: 0 0 10px;
-      font-size: 1.08rem;
-      line-height: 1.3;
-    }}
-    .detail-authors {{
-      margin: 0 0 12px;
-      color: var(--muted);
-      line-height: 1.45;
-      font-size: 0.92rem;
-    }}
-    .detail img {{
-      width: 100%;
-      border-radius: 14px;
-      border: 1px solid rgba(31, 31, 31, 0.08);
-      margin: 10px 0 12px;
-      background: #fff;
-    }}
-    .detail-topic {{
-      margin: 0 0 10px;
-      font-size: 0.82rem;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--accent);
-      font-weight: 700;
-    }}
-    .detail-abstract {{
-      margin: 0;
-      font-size: 0.92rem;
-      line-height: 1.52;
-      color: #2c2c2c;
-      max-height: 240px;
-      overflow: auto;
-    }}
-    .detail-empty {{
-      display: grid;
-      gap: 14px;
-    }}
-    .detail-empty-art {{
-      display: grid;
-      gap: 14px;
-      margin-top: 4px;
-    }}
-    .skeleton-line {{
-      display: block;
-      height: 10px;
-      border-radius: 999px;
-      background: linear-gradient(90deg, rgba(31, 31, 31, 0.06), rgba(31, 31, 31, 0.12), rgba(31, 31, 31, 0.06));
-    }}
-    .skeleton-line-lg {{ height: 14px; }}
-    .w-92 {{ width: 92%; }}
-    .w-86 {{ width: 86%; }}
-    .w-74 {{ width: 74%; }}
-    .w-68 {{ width: 68%; }}
-    .w-58 {{ width: 58%; }}
-    .detail-empty-topic {{
-      width: 42%;
-      height: 12px;
-      border-radius: 999px;
-      background: rgba(159, 58, 34, 0.16);
-    }}
-    .detail-empty-figure {{
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
-      padding: 16px;
-      border-radius: 16px;
-      min-height: 148px;
-      background:
-        linear-gradient(180deg, rgba(255, 255, 255, 0.58), rgba(255, 255, 255, 0.28)),
-        rgba(31, 31, 31, 0.035);
-      border: 1px solid rgba(31, 31, 31, 0.06);
-    }}
-    .detail-empty-blob {{
-      align-self: center;
-      justify-self: center;
-      width: clamp(64px, 26vw, 92px);
-      aspect-ratio: 1 / 1;
-      border-radius: 38% 44% 40% 46%;
-      background:
-        radial-gradient(circle at 38% 36%, rgba(196, 69, 40, 0.22), transparent 22%),
-        radial-gradient(circle at 64% 58%, rgba(31, 78, 121, 0.12), transparent 24%),
-        linear-gradient(180deg, rgba(255,255,255,0.85), rgba(225, 229, 235, 0.95));
-      border: 1px solid rgba(31, 31, 31, 0.08);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
-      opacity: 0.9;
-    }}
-    .detail-empty-blob:nth-child(2) {{
-      border-radius: 46% 34% 44% 40%;
-      width: clamp(66px, 28vw, 98px);
-    }}
-    .detail-empty-blob:nth-child(3) {{
-      border-radius: 50%;
-      width: clamp(68px, 29vw, 100px);
-    }}
-    .detail-empty-lines {{
-      display: grid;
-      gap: 10px;
-    }}
-    .tooltip {{
-      position: absolute;
-      width: min(320px, calc(100vw - 36px));
-      pointer-events: none;
-      opacity: 0;
-      transform: translateY(6px);
-      transition: opacity 120ms ease, transform 120ms ease;
-      background: rgba(26, 26, 26, 0.96);
-      color: #fff;
-      border-radius: 18px;
-      padding: 14px;
-      box-shadow: 0 22px 48px rgba(8, 8, 8, 0.28);
-      z-index: 5;
-    }}
-    .tooltip.visible {{
-      opacity: 1;
-      transform: translateY(0);
-    }}
-    .tooltip .small {{
-      margin: 0 0 6px;
-      font-size: 0.78rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: rgba(255, 255, 255, 0.74);
-    }}
-    .tooltip h3 {{
-      margin: 0 0 8px;
-      font-size: 0.96rem;
-      line-height: 1.35;
-    }}
-    .tooltip img {{
-      width: 100%;
-      margin-top: 8px;
-      border-radius: 12px;
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      background: #fff;
-    }}
-    .help {{
-      margin: 0;
-      color: var(--muted);
-      font-size: 0.9rem;
-      line-height: 1.45;
-    }}
-    .reference-note {{
-      margin: 10px 0 0;
-      color: var(--muted);
-      font-size: 0.85rem;
-      line-height: 1.45;
-    }}
-    .reference-note a {{
-      color: var(--accent);
-      font-weight: 700;
-      text-decoration-thickness: 1px;
-      text-underline-offset: 2px;
-    }}
-    .source-link {{
-      padding: 0 14px 18px;
-    }}
-    .source-link a {{
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-      padding: 10px 14px;
-      border-radius: 999px;
-      color: var(--ink);
-      font-weight: 700;
-      text-decoration: none;
-      background: rgba(31, 31, 31, 0.05);
-      border: 1px solid rgba(31, 31, 31, 0.08);
-    }}
-    .source-link a:hover {{
-      background: rgba(31, 31, 31, 0.08);
-    }}
-    .source-link svg {{
-      width: 18px;
-      height: 18px;
-      fill: currentColor;
-      flex: none;
-    }}
-    @media (max-width: 980px) {{
-      .shell {{
-        width: min(100vw - 16px, 1380px);
-        margin: 8px auto;
-        grid-template-columns: 1fr;
-      }}
-      .stage {{ padding: 18px 18px 16px; }}
-      .controls {{ grid-template-columns: 1fr; }}
-      .chart-wrap {{ padding: 0 8px 10px; }}
-      .zoom-toolbar {{
-        right: 18px;
-        top: 10px;
-      }}
-      .zoom-toolbar button {{
-        min-width: 42px;
-        min-height: 42px;
-      }}
-      .detail {{ padding: 16px 16px 18px; }}
-      .detail-card {{ height: min(60vh, 680px); }}
-      .legend {{ padding: 12px 16px 16px; }}
-      .legend-scroll {{ max-height: 240px; }}
-      .tooltip {{ display: none; }}
-    }}
-  </style>
-</head>
-<body>
-  <div class="shell">
-    <section class="card">
-      <div class="stage">
-        <div class="deck">
-          <p class="eyebrow">Conference Abstract Atlas</p>
-          <h1>CNS 2026 abstract map: If I only had a brain! (Satire)</h1>
-        </div>
-        <p class="lede"> Have you ever thought what your abstract would look like as a brain map? Think no longer, <a href="https://neurovlm.github.io/neurovlm/" target="_blank" rel="noreferrer">NeuroVLM</a> has got you covered!</p>
-        <p class="methods"><b>Methods:</b> Each point is an abstract positioned in 2D from <a href="https://arxiv.org/abs/2004.07180" target="_blank" rel="noreferrer">SPECTER</a> text embeddings, colored by <a href="https://link.springer.com/chapter/10.1007/978-3-642-37456-2_14" target="_blank" rel="noreferrer">HDBSCAN</a> cluster, and paired with a NeuroVLM-generated brainmap preview. Hover to scan, click to hold a card open, and use the three filters to narrow the landscape.</p>
-        <div class="chips" id="summary"></div>
-        <div class="controls">
-          <div class="search-field">
-            <label for="search-poster">Poster Number</label>
-            <input id="search-poster" type="search" placeholder="e.g. A14 or F129">
-          </div>
-          <div class="search-field">
-            <label for="search-title">Title</label>
-            <input id="search-title" type="search" placeholder="Filter by keywords in title">
-          </div>
-          <div class="search-field">
-            <label for="search-topic">Topic Area</label>
-            <input id="search-topic" type="search" placeholder="Filter by topic area">
-          </div>
-        </div>
-        <p class="help">Faint links connect nearest semantic neighbors in the UMAP layout. <strong>Uncategorized</strong> marks abstracts that HDBSCAN did not assign to a stable cluster.</p>
-        <p class="reference-note">Reference: brainmap previews are generated with <a href="https://neurovlm.github.io/neurovlm/" target="_blank" rel="noreferrer">NeuroVLM</a>.</p>
-      </div>
-      <div class="chart-wrap">
-        <div class="zoom-toolbar" aria-label="Graph zoom controls">
-          <button id="zoom-in" type="button" aria-label="Zoom in">+</button>
-          <button id="zoom-out" type="button" aria-label="Zoom out">-</button>
-          <button id="zoom-reset" type="button" aria-label="Reset zoom">Reset</button>
-        </div>
-        <div class="tooltip" id="tooltip"></div>
-        <svg id="graph" viewBox="0 0 {width} {height}" aria-label="UMAP cluster map"></svg>
-      </div>
-      <div class="source-link"><a href="https://github.com/jdkent/cns-abstract-explorer" target="_blank" rel="noreferrer"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.5-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.5 7.5 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg><span>Check out the source code here!</span></a></div>
-    </section>
-    <aside class="card">
-      <div class="detail">
-        <h2>Selected abstract</h2>
-        <div class="detail-card" id="detail-card"></div>
-      </div>
-      <div class="legend">
-        <h2>Cluster legend</h2>
-        <div class="legend-scroll" id="legend"></div>
-      </div>
-    </aside>
-  </div>
-  <script>
-    const nodes = {nodes_json};
-    const edges = {edges_json};
-    const legend = {legend_json};
-    const summary = {summary_json};
-    const svg = document.getElementById("graph");
-    const tooltip = document.getElementById("tooltip");
-    const legendRoot = document.getElementById("legend");
-    const summaryRoot = document.getElementById("summary");
-    const detailCard = document.getElementById("detail-card");
-    const zoomInButton = document.getElementById("zoom-in");
-    const zoomOutButton = document.getElementById("zoom-out");
-    const zoomResetButton = document.getElementById("zoom-reset");
-    const searchPoster = document.getElementById("search-poster");
-    const searchTitle = document.getElementById("search-title");
-    const searchTopic = document.getElementById("search-topic");
-    const baseViewBox = {{ x: 0, y: 0, w: {width}, h: {height} }};
-    const minZoomWidth = baseViewBox.w * 0.18;
-    let viewBox = {{ ...baseViewBox }};
-    let pinnedNodeId = null;
-    let activeClusterId = null;
-    let dragState = null;
-    let dragMoved = false;
-    let lastDragAt = 0;
-
-    function escapeHtml(value) {{
-      return value
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#39;");
-    }}
-
-    function drawSummary() {{
-      const items = [
-        `${{summary.sample_size}} abstracts`,
-        `${{summary.clusters}} clusters`,
-        `${{summary.noise_points}} uncategorized`
-      ];
-      items.forEach((label) => {{
-        const chip = document.createElement("span");
-        chip.className = "chip";
-        chip.textContent = label;
-        summaryRoot.appendChild(chip);
-      }});
-    }}
-
-    function drawLegend() {{
-      legend.forEach((item) => {{
-        const row = document.createElement("div");
-        row.className = "legend-item";
-        row.tabIndex = 0;
-        row.setAttribute("role", "button");
-        row.dataset.clusterId = String(item.cluster_id);
-        row.innerHTML = `
-          <span class="swatch" style="background:${{item.color}}"></span>
-          <strong>${{item.label}}</strong>
-          <span style="margin-left:auto;color:#415a77">${{item.count}}</span>
-        `;
-        const toggleCluster = () => {{
-          activeClusterId = activeClusterId === item.cluster_id ? null : item.cluster_id;
-          pinnedNodeId = null;
-          updateDetail(null);
-          updateLegendSelection();
-          render();
-        }};
-        row.addEventListener("click", toggleCluster);
-        row.addEventListener("keydown", (event) => {{
-          if (event.key === "Enter" || event.key === " ") {{
-            event.preventDefault();
-            toggleCluster();
-          }}
-        }});
-        legendRoot.appendChild(row);
-      }});
-    }}
-
-    function updateLegendSelection() {{
-      Array.from(legendRoot.children).forEach((row) => {{
-        const isActive = row.dataset.clusterId === String(activeClusterId);
-        row.classList.toggle("active", isActive);
-        row.setAttribute("aria-pressed", isActive ? "true" : "false");
-      }});
-    }}
-
-    function emptyDetailMarkup() {{
-      return `
-        <div class="detail-empty">
-          <div>
-            <p class="detail-meta">Nothing selected yet</p>
-            <p class="detail-abstract">Hover or click a node to inspect its poster number, title, topic area, and generated brainmap.</p>
-          </div>
-          <div class="detail-empty-art" aria-hidden="true">
-            <span class="skeleton-line skeleton-line-lg w-92"></span>
-            <span class="skeleton-line skeleton-line-lg w-74"></span>
-            <span class="skeleton-line w-58"></span>
-            <div class="detail-empty-topic"></div>
-            <div class="detail-empty-figure">
-              <span class="detail-empty-blob"></span>
-              <span class="detail-empty-blob"></span>
-              <span class="detail-empty-blob"></span>
-            </div>
-            <div class="detail-empty-lines">
-              <span class="skeleton-line w-92"></span>
-              <span class="skeleton-line w-86"></span>
-              <span class="skeleton-line w-92"></span>
-              <span class="skeleton-line w-68"></span>
-            </div>
-          </div>
-        </div>
-      `;
-    }}
-
-    function updateDetail(node) {{
-      if (!node) {{
-        detailCard.innerHTML = emptyDetailMarkup();
-        return;
-      }}
-      detailCard.innerHTML = `
-        <p class="detail-meta">${{escapeHtml(node.poster_number)}} • ${{escapeHtml(node.cluster_name)}}</p>
-        <h3 class="detail-title">${{escapeHtml(node.title)}}</h3>
-        <p class="detail-authors">${{escapeHtml(node.authors)}}</p>
-        <p class="detail-topic">${{escapeHtml(node.topic_area || "No topic area listed")}}</p>
-        <img src="${{node.brainmap_data_url}}" alt="Brainmap for ${{escapeHtml(node.poster_number)}}">
-        <p class="detail-abstract">${{escapeHtml(node.abstract)}}</p>
-      `;
-    }}
-
-    function showTooltip(node, event) {{
-      tooltip.innerHTML = `
-        <p class="small">${{escapeHtml(node.poster_number)}} • ${{escapeHtml(node.cluster_name)}}</p>
-        <h3>${{escapeHtml(node.title)}}</h3>
-        <p class="small" style="margin:0;color:rgba(255,255,255,0.65)">${{escapeHtml(node.topic_area || "No topic area listed")}}</p>
-        <img src="${{node.brainmap_data_url}}" alt="Brainmap preview">
-      `;
-      const bounds = svg.getBoundingClientRect();
-      tooltip.style.left = `${{Math.min(event.clientX - bounds.left + 18, bounds.width - 300)}}px`;
-      tooltip.style.top = `${{Math.max(event.clientY - bounds.top - 14, 18)}}px`;
-      tooltip.classList.add("visible");
-    }}
-
-    function hideTooltip() {{
-      tooltip.classList.remove("visible");
-    }}
-
-    function clampViewBox() {{
-      if (viewBox.w < minZoomWidth) {{
-        viewBox.w = minZoomWidth;
-        viewBox.h = baseViewBox.h * (viewBox.w / baseViewBox.w);
-      }}
-      if (viewBox.w > baseViewBox.w) {{
-        viewBox = {{ ...baseViewBox }};
-      }}
-      const maxX = baseViewBox.x + baseViewBox.w - viewBox.w;
-      const maxY = baseViewBox.y + baseViewBox.h - viewBox.h;
-      viewBox.x = Math.min(Math.max(viewBox.x, baseViewBox.x), maxX);
-      viewBox.y = Math.min(Math.max(viewBox.y, baseViewBox.y), maxY);
-    }}
-
-    function applyViewBox() {{
-      clampViewBox();
-      svg.setAttribute("viewBox", `${{viewBox.x}} ${{viewBox.y}} ${{viewBox.w}} ${{viewBox.h}}`);
-    }}
-
-    function eventToGraphPoint(event) {{
-      const bounds = svg.getBoundingClientRect();
-      const relX = (event.clientX - bounds.left) / bounds.width;
-      const relY = (event.clientY - bounds.top) / bounds.height;
-      return {{
-        x: viewBox.x + (relX * viewBox.w),
-        y: viewBox.y + (relY * viewBox.h)
-      }};
-    }}
-
-    function zoomAt(pointX, pointY, factor) {{
-      const nextWidth = Math.min(baseViewBox.w, Math.max(minZoomWidth, viewBox.w * factor));
-      const nextHeight = baseViewBox.h * (nextWidth / baseViewBox.w);
-      const relX = (pointX - viewBox.x) / viewBox.w;
-      const relY = (pointY - viewBox.y) / viewBox.h;
-      viewBox = {{
-        x: pointX - (relX * nextWidth),
-        y: pointY - (relY * nextHeight),
-        w: nextWidth,
-        h: nextHeight
-      }};
-      applyViewBox();
-    }}
-
-    function zoomByFactor(factor) {{
-      const centerX = viewBox.x + (viewBox.w / 2);
-      const centerY = viewBox.y + (viewBox.h / 2);
-      zoomAt(centerX, centerY, factor);
-    }}
-
-    function resetZoom() {{
-      viewBox = {{ ...baseViewBox }};
-      applyViewBox();
-    }}
-
-    function currentFilters() {{
-      return {{
-        poster: searchPoster.value.trim().toLowerCase(),
-        title: searchTitle.value.trim().toLowerCase(),
-        topic: searchTopic.value.trim().toLowerCase(),
-        cluster: activeClusterId
-      }};
-    }}
-
-    function render() {{
-      svg.innerHTML = "";
-      const filters = currentFilters();
-      const visibleNodes = nodes.filter((node) =>
-        (filters.cluster === null || node.cluster === filters.cluster) &&
-        (!filters.poster || node.poster_number.toLowerCase().includes(filters.poster)) &&
-        (!filters.title || node.title.toLowerCase().includes(filters.title)) &&
-        (!filters.topic || (node.topic_area || "").toLowerCase().includes(filters.topic))
-      );
-      const visibleIds = new Set(visibleNodes.map((node) => node.id));
-
-      if (pinnedNodeId !== null && !visibleIds.has(pinnedNodeId)) {{
-        pinnedNodeId = null;
-        updateDetail(null);
-      }}
-
-      edges
-        .filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target))
-        .forEach((edge) => {{
-          const source = nodes[edge.source];
-          const target = nodes[edge.target];
-          const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-          line.setAttribute("x1", source.x);
-          line.setAttribute("y1", source.y);
-          line.setAttribute("x2", target.x);
-          line.setAttribute("y2", target.y);
-          line.setAttribute("stroke", "rgba(20, 33, 61, 0.12)");
-          line.setAttribute("stroke-width", Math.max(0.7, 2.3 - (edge.distance * 1.6)).toFixed(2));
-          svg.appendChild(line);
-        }});
-
-      visibleNodes.forEach((node) => {{
-        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-        circle.setAttribute("cx", node.x);
-        circle.setAttribute("cy", node.y);
-        circle.setAttribute("r", node.id === pinnedNodeId ? "10.5" : "7.5");
-        circle.setAttribute("fill", node.color);
-        circle.setAttribute("stroke", node.id === pinnedNodeId ? "#14213d" : "rgba(255,255,255,0.92)");
-        circle.setAttribute("stroke-width", node.id === pinnedNodeId ? "3" : "2");
-        circle.style.cursor = "pointer";
-
-        circle.addEventListener("pointerdown", (event) => {{
-          event.stopPropagation();
-        }});
-
-        circle.addEventListener("mouseenter", (event) => {{
-          showTooltip(node, event);
-          if (pinnedNodeId === null) {{
-            updateDetail(node);
-          }}
-        }});
-        circle.addEventListener("mousemove", (event) => showTooltip(node, event));
-        circle.addEventListener("mouseleave", () => {{
-          hideTooltip();
-          if (pinnedNodeId === null) {{
-            updateDetail(null);
-          }}
-        }});
-        circle.addEventListener("click", () => {{
-          if (Date.now() - lastDragAt < 220) {{
-            return;
-          }}
-          pinnedNodeId = pinnedNodeId === node.id ? null : node.id;
-          updateDetail(pinnedNodeId === null ? null : node);
-          render();
-        }});
-        svg.appendChild(circle);
-      }});
-      applyViewBox();
-    }}
-
-    [searchPoster, searchTitle, searchTopic].forEach((input) => {{
-      input.addEventListener("input", () => {{
-        pinnedNodeId = null;
-        updateDetail(null);
-        render();
-      }});
-    }});
-
-    svg.addEventListener("wheel", (event) => {{
-      event.preventDefault();
-      const point = eventToGraphPoint(event);
-      zoomAt(point.x, point.y, event.deltaY < 0 ? 0.85 : 1.18);
-    }}, {{ passive: false }});
-
-    svg.addEventListener("pointerdown", (event) => {{
-      if (event.pointerType === "mouse" && event.button !== 0) {{
-        return;
-      }}
-      dragState = {{
-        pointerId: event.pointerId,
-        clientX: event.clientX,
-        clientY: event.clientY,
-        startX: viewBox.x,
-        startY: viewBox.y
-      }};
-      dragMoved = false;
-      svg.setPointerCapture(event.pointerId);
-      svg.classList.add("is-dragging");
-    }});
-
-    svg.addEventListener("pointermove", (event) => {{
-      if (!dragState || dragState.pointerId !== event.pointerId) {{
-        return;
-      }}
-      const bounds = svg.getBoundingClientRect();
-      const deltaX = event.clientX - dragState.clientX;
-      const deltaY = event.clientY - dragState.clientY;
-      if (Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3) {{
-        dragMoved = true;
-      }}
-      viewBox.x = dragState.startX - ((deltaX / bounds.width) * viewBox.w);
-      viewBox.y = dragState.startY - ((deltaY / bounds.height) * viewBox.h);
-      applyViewBox();
-    }});
-
-    function finishDrag(event) {{
-      if (!dragState || dragState.pointerId !== event.pointerId) {{
-        return;
-      }}
-      if (dragMoved) {{
-        lastDragAt = Date.now();
-      }}
-      dragState = null;
-      dragMoved = false;
-      svg.classList.remove("is-dragging");
-    }}
-
-    svg.addEventListener("pointerup", finishDrag);
-    svg.addEventListener("pointercancel", finishDrag);
-
-    zoomInButton.addEventListener("click", () => zoomByFactor(0.82));
-    zoomOutButton.addEventListener("click", () => zoomByFactor(1.2));
-    zoomResetButton.addEventListener("click", resetZoom);
-
-    drawSummary();
-    drawLegend();
-    updateLegendSelection();
-    updateDetail(null);
-    applyViewBox();
-    render();
-  </script>
-</body>
-</html>
-"""
-    output_path.write_text(html_text, encoding="utf-8")
+    html_build_graph(
+        rows=rows,
+        coords=[(float(x), float(y)) for x, y in coords.tolist()],
+        labels=[int(label) for label in labels.tolist()],
+        brainmaps=brainmap_urls,
+        output_path=output_path,
+        embedding_space=embedding_space,
+        cluster_names=cluster_names,
+    )
 
 
 def human_readable_seconds(seconds: float) -> str:
@@ -1632,59 +1072,6 @@ def human_readable_seconds(seconds: float) -> str:
     return f"{hours:.1f}h"
 
 
-def publish_github_pages_bundle(
-    bundle_dir: Path,
-    graph_html: Path,
-    summary_json: Path,
-    cluster_csv: Path,
-    sample_csv: Path,
-    structured_csv: Path,
-    embeddings_npz: Path,
-) -> None:
-    data_dir = bundle_dir / "data"
-    code_dir = bundle_dir / "code"
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    code_dir.mkdir(parents=True, exist_ok=True)
-
-    shutil.copy2(graph_html, bundle_dir / "index.html")
-    shutil.copy2(summary_json, data_dir / summary_json.name)
-    shutil.copy2(cluster_csv, data_dir / cluster_csv.name)
-    shutil.copy2(sample_csv, data_dir / sample_csv.name)
-    shutil.copy2(structured_csv, data_dir / structured_csv.name)
-    shutil.copy2(embeddings_npz, data_dir / embeddings_npz.name)
-    for source in (
-        PROJECT_ROOT / "pyproject.toml",
-        PROJECT_ROOT / "scripts" / "build_cns_2026_html.py",
-        Path(__file__).resolve(),
-    ):
-        if source.exists():
-            shutil.copy2(source, code_dir / source.name)
-
-    readme = bundle_dir / "README.md"
-    readme.write_text(
-        "\n".join(
-            [
-                "# CNS 2026 Abstract Map",
-                "",
-                "This directory is the GitHub Pages bundle for the CNS 2026 abstract map.",
-                "",
-                "Treat `neurovlm_cns/` as the project root when rebuilding.",
-                "",
-                "From that root, run:",
-                "",
-                "```bash",
-                "python scripts/build_cns_2026_html.py",
-                "```",
-                "",
-                "The generated page in this bundle is `index.html`.",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    (bundle_dir / ".nojekyll").write_text("", encoding="utf-8")
-
-
 def write_summary(
     output_path: Path,
     all_abstracts: pd.DataFrame,
@@ -1693,6 +1080,8 @@ def write_summary(
     embedding_times: dict[str, float],
     brainmap_metrics: dict[str, float],
     sample_strategy: str,
+    cluster_embedding_space: str,
+    cluster_names: dict[int, str],
 ) -> None:
     sample_size = max(1, len(sample_df))
     total_count = len(all_abstracts)
@@ -1706,6 +1095,7 @@ def write_summary(
         "parsed_abstract_count": total_count,
         "sample_size": sample_size,
         "sample_strategy": sample_strategy,
+        "cluster_embedding_space": cluster_embedding_space,
         "parse_runtime_s": round(stage_times["parse_runtime_s"], 3),
         "embedding_runtime_s": round(stage_times["embedding_runtime_s"], 3),
         "brainmap_runtime_s": round(stage_times["brainmap_runtime_s"], 3),
@@ -1718,6 +1108,7 @@ def write_summary(
         "chunk_inference_s": round(embedding_times["chunk_inference_s"], 3),
         "estimated_full_runtime_s": round(estimated_full_runtime_s, 3),
         "estimated_full_runtime_human": human_readable_seconds(estimated_full_runtime_s),
+        "cluster_names": {str(cluster_id): name for cluster_id, name in sorted(cluster_names.items())},
         "notes": [
             "Estimate is a warm-cache linear extrapolation from the sampled embedding and brainmap stages.",
             "First-run Hugging Face downloads will add one-time startup cost that is not included in the warm-cache estimate.",
@@ -1732,6 +1123,22 @@ def choose_sample(all_abstracts: pd.DataFrame, sample_size: int, strategy: str) 
     if strategy == "random":
         return all_abstracts.sample(n=sample_size, random_state=SAMPLE_SEED).sort_values("poster_number").reset_index(drop=True)
     return all_abstracts.head(sample_size).reset_index(drop=True)
+
+
+def artifact_tag(sample_tag: str, cluster_embedding_space: str) -> str:
+    if cluster_embedding_space == "specter":
+        return sample_tag
+    return f"{sample_tag}_{cluster_embedding_space}"
+
+
+def clustering_input_embeddings(
+    specter_embeddings: np.ndarray,
+    neurovlm_embeddings: np.ndarray,
+    cluster_embedding_space: str,
+) -> np.ndarray:
+    if cluster_embedding_space == "specter":
+        return specter_embeddings
+    return neurovlm_embeddings
 
 
 def main() -> None:
@@ -1759,6 +1166,7 @@ def main() -> None:
 
     sample_df = choose_sample(all_abstracts, args.sample_size, args.sample_strategy)
     sample_tag = f"sample_{len(sample_df):03d}_{args.sample_strategy}"
+    run_tag = artifact_tag(sample_tag, args.cluster_embedding_space)
     sample_csv = OUTPUT_DIR / f"cns_2026_{sample_tag}_abstracts.csv"
     sample_df.to_csv(sample_csv, index=False)
     logger.info("Wrote sample CSV to %s", sample_csv)
@@ -1788,20 +1196,38 @@ def main() -> None:
     stage_times["brainmap_runtime_s"] = timer.elapsed
 
     with timed("cluster", logger) as timer:
-        umap_coords, labels = cluster_embeddings(specter_embeddings, logger)
-        cluster_csv = OUTPUT_DIR / f"cns_2026_{sample_tag}_clusters.csv"
+        cluster_input = clustering_input_embeddings(
+            specter_embeddings=specter_embeddings,
+            neurovlm_embeddings=neurovlm_embeddings,
+            cluster_embedding_space=args.cluster_embedding_space,
+        )
+        cluster_params = resolve_cluster_params(
+            count=len(sample_df),
+            embedding_space=args.cluster_embedding_space,
+            args=args,
+        )
+        umap_coords, labels = cluster_embeddings(
+            text_embeddings=cluster_input,
+            embedding_space=args.cluster_embedding_space,
+            logger=logger,
+            cluster_params=cluster_params,
+        )
+        cluster_csv = OUTPUT_DIR / f"cns_2026_{run_tag}_clusters.csv"
         clustered = sample_df.copy()
         clustered["umap_x"] = umap_coords[:, 0]
         clustered["umap_y"] = umap_coords[:, 1]
         clustered["cluster"] = labels
+        cluster_names = generate_cluster_names(sample_df=sample_df, labels=labels, logger=logger)
+        clustered["cluster_name"] = [cluster_names.get(int(label), cluster_name_fallback(int(label))) for label in labels.tolist()]
         clustered.to_csv(cluster_csv, index=False)
         logger.info("Wrote clustering CSV to %s", cluster_csv)
     stage_times["cluster_runtime_s"] = timer.elapsed
 
-    embedding_npz = OUTPUT_DIR / f"cns_2026_{sample_tag}_embeddings.npz"
+    embedding_npz = OUTPUT_DIR / f"cns_2026_{run_tag}_embeddings.npz"
     save_npz(
         embedding_npz,
         poster_numbers=sample_df["poster_number"].astype(str).to_numpy(dtype="U32"),
+        cluster_embedding_space=np.array([args.cluster_embedding_space], dtype="U16"),
         specter_embeddings=specter_embeddings.astype(np.float32),
         neurovlm_embeddings=neurovlm_embeddings.astype(np.float32),
         umap_coordinates=umap_coords.astype(np.float32),
@@ -1809,7 +1235,7 @@ def main() -> None:
     )
     logger.info("Wrote output embeddings package to %s", embedding_npz)
 
-    graph_html = OUTPUT_DIR / f"cns_2026_{sample_tag}_map.html"
+    graph_html = OUTPUT_DIR / f"cns_2026_{run_tag}_map.html"
     with timed("build-html", logger) as timer:
         build_graph_html(
             sample_df=sample_df,
@@ -1817,11 +1243,13 @@ def main() -> None:
             labels=labels,
             brainmaps_b64=brainmaps_b64,
             output_path=graph_html,
+            embedding_space=args.cluster_embedding_space,
+            cluster_names=cluster_names,
         )
         logger.info("Wrote interactive graph to %s", graph_html)
     stage_times["html_runtime_s"] = timer.elapsed
 
-    summary_json = OUTPUT_DIR / f"cns_2026_{sample_tag}_summary.json"
+    summary_json = OUTPUT_DIR / f"cns_2026_{run_tag}_summary.json"
     write_summary(
         output_path=summary_json,
         all_abstracts=all_abstracts,
@@ -1830,19 +1258,13 @@ def main() -> None:
         embedding_times=embedding_times,
         brainmap_metrics=brainmap_metrics,
         sample_strategy=args.sample_strategy,
+        cluster_embedding_space=args.cluster_embedding_space,
+        cluster_names=cluster_names,
     )
     logger.info("Wrote summary to %s", summary_json)
 
     publish_dir = PROJECT_ROOT / "docs" / "cns_2026_map"
-    publish_github_pages_bundle(
-        bundle_dir=publish_dir,
-        graph_html=graph_html,
-        summary_json=summary_json,
-        cluster_csv=cluster_csv,
-        sample_csv=sample_csv,
-        structured_csv=structured_csv,
-        embeddings_npz=embedding_npz,
-    )
+    publish_html_bundle(graph_html, cluster_csv, sample_tag)
     logger.info("Published GitHub Pages bundle to %s", publish_dir)
     logger.info("Prototype complete: parsed=%s sample=%s", len(all_abstracts), len(sample_df))
 

@@ -19,7 +19,7 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 CACHE_DIR = OUTPUT_DIR / "cache" / "cns_2026_prototype"
 DOCS_DIR = PROJECT_ROOT / "docs" / "cns_2026_map"
 TRANSPARENT_GIF_DATA_URL = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
-CLUSTER_NAME_RE = re.compile(r"cns_2026_(sample_\d+_[a-z]+)_clusters\.csv$")
+CLUSTER_NAME_RE = re.compile(r"cns_2026_(sample_\d+_[a-z]+)(?:_(specter|neurovlm))?_clusters\.csv$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,15 +48,39 @@ def sample_tag_from_cluster_csv(cluster_csv: Path) -> str:
     match = CLUSTER_NAME_RE.fullmatch(cluster_csv.name)
     if not match:
         raise ValueError(
-            "Cluster CSV name must match cns_2026_<sample_tag>_clusters.csv "
+            "Cluster CSV name must match cns_2026_<sample_tag>[_<embedding_space>]_clusters.csv "
             f"so the brainmap cache can be inferred. Got: {cluster_csv.name}"
         )
     return match.group(1)
 
 
+def run_tag_from_cluster_csv(cluster_csv: Path) -> str:
+    match = CLUSTER_NAME_RE.fullmatch(cluster_csv.name)
+    if not match:
+        raise ValueError(
+            "Cluster CSV name must match cns_2026_<sample_tag>[_<embedding_space>]_clusters.csv "
+            f"so related artifacts can be inferred. Got: {cluster_csv.name}"
+        )
+    sample_tag = match.group(1)
+    embedding_space = match.group(2)
+    if embedding_space:
+        return f"{sample_tag}_{embedding_space}"
+    return sample_tag
+
+
+def embedding_space_from_cluster_csv(cluster_csv: Path) -> str:
+    match = CLUSTER_NAME_RE.fullmatch(cluster_csv.name)
+    if not match:
+        raise ValueError(
+            "Cluster CSV name must match cns_2026_<sample_tag>[_<embedding_space>]_clusters.csv "
+            f"so related artifacts can be inferred. Got: {cluster_csv.name}"
+        )
+    return match.group(2) or "specter"
+
+
 def default_output_path(cluster_csv: Path) -> Path:
-    sample_tag = sample_tag_from_cluster_csv(cluster_csv)
-    return cluster_csv.with_name(f"cns_2026_{sample_tag}_map.html")
+    run_tag = run_tag_from_cluster_csv(cluster_csv)
+    return cluster_csv.with_name(f"cns_2026_{run_tag}_map.html")
 
 
 def infer_brainmap_dir(sample_tag: str) -> Path:
@@ -101,6 +125,24 @@ def cluster_color(label: int) -> str:
     if label < 0:
         return "#9c8f7a"
     return palette[label % len(palette)]
+
+
+def default_cluster_name(label: int) -> str:
+    if label < 0:
+        return "Uncategorized"
+    return f"Cluster {label}"
+
+
+def cluster_name_map_from_rows(rows: list[dict[str, str]], labels: list[int]) -> dict[int, str]:
+    cluster_names: dict[int, str] = {}
+    for row, label in zip(rows, labels):
+        if label < 0:
+            continue
+        name = row.get("cluster_name", "").strip()
+        if not name:
+            continue
+        cluster_names.setdefault(label, name)
+    return cluster_names
 
 
 def scaled_coordinates(coords: list[tuple[float, float]], width: int, height: int, padding: int = 56) -> list[tuple[float, float]]:
@@ -163,17 +205,23 @@ def build_graph_html(
     labels: list[int],
     brainmaps: dict[str, str],
     output_path: Path,
+    embedding_space: str = "specter",
+    cluster_names: dict[int, str] | None = None,
 ) -> None:
     width = 1180
     height = 760
     graph_coords = scaled_coordinates(coords, width=width, height=height)
     edges = build_edges(coords)
+    resolved_cluster_names = cluster_name_map_from_rows(rows, labels)
+    if cluster_names:
+        resolved_cluster_names.update(cluster_names)
 
     nodes: list[dict[str, Any]] = []
     for idx, row in enumerate(rows):
         label = labels[idx]
         poster = row["poster_number"]
         topic_area = row.get("topic_area", "")
+        cluster_name = resolved_cluster_names.get(label, default_cluster_name(label))
         nodes.append(
             {
                 "id": idx,
@@ -183,7 +231,7 @@ def build_graph_html(
                 "abstract": row["abstract"],
                 "topic_area": topic_area,
                 "cluster": label,
-                "cluster_name": "Uncategorized" if label < 0 else f"Cluster {label}",
+                "cluster_name": cluster_name,
                 "x": graph_coords[idx][0],
                 "y": graph_coords[idx][1],
                 "color": cluster_color(label),
@@ -201,7 +249,7 @@ def build_graph_html(
     legend = [
         {
             "cluster_id": cluster_id,
-            "label": "Uncategorized" if cluster_id < 0 else f"Cluster {cluster_id}",
+            "label": resolved_cluster_names.get(cluster_id, default_cluster_name(cluster_id)),
             "count": cluster_counts[cluster_id],
             "color": cluster_color(cluster_id),
         }
@@ -212,6 +260,11 @@ def build_graph_html(
     edges_json = json.dumps(edges)
     legend_json = json.dumps(legend)
     summary_json = json.dumps(summary)
+    embedding_label_html = (
+        '<a href="https://arxiv.org/abs/2004.07180" target="_blank" rel="noreferrer">SPECTER</a> text embeddings'
+        if embedding_space == "specter"
+        else '<a href="https://neurovlm.github.io/neurovlm/" target="_blank" rel="noreferrer">NeuroVLM</a> projected text embeddings'
+    )
 
     html_text = f"""<!DOCTYPE html>
 <html lang="en">
@@ -664,7 +717,7 @@ def build_graph_html(
           <h1>CNS 2026 abstract map: If I only had a brain! (Satire)</h1>
         </div>
         <p class="lede"> Have you ever thought what your abstract would look like as a brain map? Think no longer, <a href="https://neurovlm.github.io/neurovlm/" target="_blank" rel="noreferrer">NeuroVLM</a> has got you covered!</p>
-        <p class="methods"><b>Methods:</b> Each point is an abstract positioned in 2D from <a href="https://arxiv.org/abs/2004.07180" target="_blank" rel="noreferrer">SPECTER</a> text embeddings, colored by <a href="https://link.springer.com/chapter/10.1007/978-3-642-37456-2_14" target="_blank" rel="noreferrer">HDBSCAN</a> cluster, and paired with a NeuroVLM-generated brainmap preview. Hover to scan, click to hold a card open, and use the three filters to narrow the landscape.</p>
+        <p class="methods"><b>Methods:</b> Each point is an abstract positioned in 2D from {embedding_label_html}, colored by <a href="https://link.springer.com/chapter/10.1007/978-3-642-37456-2_14" target="_blank" rel="noreferrer">HDBSCAN</a> cluster, and paired with a NeuroVLM-generated brainmap preview. Cluster names are derived from the titles within each cluster using an OpenAI model prompted to return short theme labels and to disambiguate duplicate names when needed. Hover to scan, click to hold a card open, and use the three filters to narrow the landscape.</p>
         <div class="chips" id="summary"></div>
         <div class="controls">
           <div class="search-field">
@@ -1071,6 +1124,7 @@ def copy_if_exists(source: Path, destination: Path) -> None:
 
 
 def publish_bundle(output_html: Path, cluster_csv: Path, sample_tag: str) -> None:
+    run_tag = run_tag_from_cluster_csv(cluster_csv)
     data_dir = DOCS_DIR / "data"
     code_dir = DOCS_DIR / "code"
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1081,8 +1135,8 @@ def publish_bundle(output_html: Path, cluster_csv: Path, sample_tag: str) -> Non
     copy_if_exists(cluster_csv, data_dir / cluster_csv.name)
     copy_if_exists(OUTPUT_DIR / "cns_2026_abstracts_structured.csv", data_dir / "cns_2026_abstracts_structured.csv")
     copy_if_exists(OUTPUT_DIR / f"cns_2026_{sample_tag}_abstracts.csv", data_dir / f"cns_2026_{sample_tag}_abstracts.csv")
-    copy_if_exists(OUTPUT_DIR / f"cns_2026_{sample_tag}_summary.json", data_dir / f"cns_2026_{sample_tag}_summary.json")
-    copy_if_exists(OUTPUT_DIR / f"cns_2026_{sample_tag}_embeddings.npz", data_dir / f"cns_2026_{sample_tag}_embeddings.npz")
+    copy_if_exists(OUTPUT_DIR / f"cns_2026_{run_tag}_summary.json", data_dir / f"cns_2026_{run_tag}_summary.json")
+    copy_if_exists(OUTPUT_DIR / f"cns_2026_{run_tag}_embeddings.npz", data_dir / f"cns_2026_{run_tag}_embeddings.npz")
 
     copy_if_exists(PROJECT_ROOT / "pyproject.toml", code_dir / "pyproject.toml")
     copy_if_exists(PROJECT_ROOT / "scripts" / "build_cns_2026_html.py", code_dir / "build_cns_2026_html.py")
@@ -1101,7 +1155,7 @@ def publish_bundle(output_html: Path, cluster_csv: Path, sample_tag: str) -> Non
                 "From that root, run:",
                 "",
                 "```bash",
-                "python scripts/build_cns_2026_html.py",
+                ".venv/bin/python scripts/build_cns_2026_html.py",
                 "```",
                 "",
                 "The generated page in this bundle is `index.html`.",
@@ -1129,7 +1183,14 @@ def main() -> None:
     labels = [int(float(row["cluster"])) for row in rows]
     brainmaps = load_brainmap_urls(rows, brainmap_dir)
 
-    build_graph_html(rows, coords, labels, brainmaps, output_path)
+    build_graph_html(
+        rows,
+        coords,
+        labels,
+        brainmaps,
+        output_path,
+        embedding_space=embedding_space_from_cluster_csv(cluster_csv),
+    )
     if not args.skip_publish:
         publish_bundle(output_path, cluster_csv, sample_tag)
 

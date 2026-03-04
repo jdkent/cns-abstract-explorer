@@ -7,7 +7,7 @@ Treat `neurovlm_cns/` as the project root when rebuilding.
 From that root, run:
 
 ```bash
-python scripts/build_cns_2026_html.py
+.venv/bin/python scripts/build_cns_2026_html.py
 ```
 
 The generated page in this bundle is `index.html`.
