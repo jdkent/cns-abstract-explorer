@@ -757,14 +757,18 @@ def parse_json_object(raw_text: str) -> dict[str, Any] | None:
     return None
 
 
-def request_cluster_name(
-    cluster_id: int,
-    titles: list[str],
+def request_global_cluster_names(
+    titles_by_cluster: dict[int, list[str]],
     api_key: str,
     model: str,
     logger: logging.Logger,
-) -> str:
-    prompt_titles = "\n".join(f"- {title}" for title in titles)
+) -> dict[int, str]:
+    prompt_sections = []
+    for cluster_id in sorted(titles_by_cluster):
+        titles = titles_by_cluster[cluster_id]
+        title_lines = "\n".join(f"- {title}" for title in titles)
+        prompt_sections.append(f"Cluster {cluster_id} titles:\n{title_lines}")
+    prompt_text = "\n\n".join(prompt_sections)
     try:
         body = openai_chat_completion(
             api_key=api_key,
@@ -774,35 +778,53 @@ def request_cluster_name(
                     "role": "system",
                     "content": (
                         "You are a professional neuroscientist who is fantastic at seeing patterns "
-                        "in neuroscientific text."
+                        "in neuroscientific text and differentiating closely related topics. "
+                        "You prefer broader umbrella themes over narrow task names, methods, or highly specific subtopics."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        "Below are all abstract titles from one cluster in a neuroscience poster map.\n"
-                        "Return only 1-3 words that best represent the shared theme across these titles.\n"
-                        "Do not include numbering, punctuation, or any explanation.\n\n"
-                        f"{prompt_titles}"
+                        "Below are the title sets for every non-noise cluster in a neuroscience poster map.\n"
+                        "Read all clusters together and generate broad but still distinctive, descriptive, and "
+                        "representative labels for every cluster.\n"
+                        "Return exactly one 1-3 word label per cluster.\n"
+                        "Prefer umbrella categories that summarize the dominant theme of each cluster rather than "
+                        "narrow methods, paradigms, or single-study-specific details.\n"
+                        "Avoid overly specific labels unless a narrow theme clearly dominates the whole cluster.\n"
+                        "Make the labels globally distinct from each other, not just locally descriptive.\n"
+                        "Return JSON only as an object mapping cluster ids to labels, for example "
+                        '{"0":"Working Memory","1":"Auditory Attention"}.\n'
+                        "Do not include explanation text.\n\n"
+                        f"{prompt_text}"
                     ),
                 },
             ],
-            max_tokens=12,
+            max_tokens=max(120, len(titles_by_cluster) * 12),
         )
     except urllib_error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        logger.warning("OpenAI cluster naming failed for cluster %s: %s", cluster_id, detail)
-        return cluster_name_fallback(cluster_id)
+        logger.warning("OpenAI global cluster naming failed: %s", detail)
+        return {}
     except urllib_error.URLError as exc:
-        logger.warning("OpenAI cluster naming failed for cluster %s: %s", cluster_id, exc)
-        return cluster_name_fallback(cluster_id)
+        logger.warning("OpenAI global cluster naming failed: %s", exc)
+        return {}
 
     if body is None:
-        return cluster_name_fallback(cluster_id)
-    content = extract_openai_message_content(body)
-    name = normalize_cluster_name(content, cluster_id)
-    logger.info("Named cluster %s as %s", cluster_id, name)
-    return name
+        return {}
+    parsed = parse_json_object(extract_openai_message_content(body))
+    if not parsed:
+        logger.warning("OpenAI global cluster naming returned non-JSON.")
+        return {}
+
+    cluster_names: dict[int, str] = {}
+    for cluster_id in sorted(titles_by_cluster):
+        raw_name = parsed.get(str(cluster_id), parsed.get(cluster_id))
+        if raw_name is None:
+            continue
+        cluster_names[cluster_id] = normalize_cluster_name(str(raw_name), cluster_id)
+        logger.info("Named cluster %s as %s", cluster_id, cluster_names[cluster_id])
+    return cluster_names
 
 
 def resolve_duplicate_cluster_names(
@@ -834,7 +856,8 @@ def resolve_duplicate_cluster_names(
                         "role": "system",
                         "content": (
                             "You are a professional neuroscientist who is fantastic at seeing patterns "
-                            "in neuroscientific text and differentiating closely related topics."
+                            "in neuroscientific text and differentiating closely related topics. "
+                            "You prefer broader umbrella themes over narrow task names, methods, or highly specific subtopics."
                         ),
                     },
                     {
@@ -843,6 +866,8 @@ def resolve_duplicate_cluster_names(
                             "These clusters were previously given the same label, but they need distinct names.\n"
                             "For each cluster below, generate a different 1-3 word label that best matches that "
                             "cluster's titles while clearly distinguishing it from the others in this request.\n"
+                            "Prefer broader umbrella labels rather than narrow methods, paradigms, or one-off details.\n"
+                            "Keep the labels distinct, but do not overfit to minor differences.\n"
                             "Return JSON only as an object mapping cluster ids to labels, for example "
                             '{"3":"Working Memory","11":"Task Switching"}.\n'
                             "Do not include explanation text.\n\n"
@@ -923,18 +948,14 @@ def generate_cluster_names(sample_df: pd.DataFrame, labels: np.ndarray, logger: 
         cluster_id: sample_df.loc[labels == cluster_id, "title"].astype(str).tolist()
         for cluster_id in cluster_ids
     }
-    cluster_names: dict[int, str] = {}
+    cluster_names = request_global_cluster_names(
+        titles_by_cluster=titles_by_cluster,
+        api_key=api_key,
+        model=model,
+        logger=logger,
+    )
     for cluster_id in cluster_ids:
-        titles = titles_by_cluster.get(cluster_id, [])
-        if not titles:
-            continue
-        cluster_names[cluster_id] = request_cluster_name(
-            cluster_id=cluster_id,
-            titles=titles,
-            api_key=api_key,
-            model=model,
-            logger=logger,
-        )
+        cluster_names.setdefault(cluster_id, cluster_name_fallback(cluster_id))
     return resolve_duplicate_cluster_names(
         cluster_names=cluster_names,
         titles_by_cluster=titles_by_cluster,

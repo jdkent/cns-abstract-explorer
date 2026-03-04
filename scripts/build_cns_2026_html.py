@@ -717,7 +717,7 @@ def build_graph_html(
           <h1>CNS 2026 abstract map: If I only had a brain! (Satire)</h1>
         </div>
         <p class="lede"> Have you ever thought what your abstract would look like as a brain map? Think no longer, <a href="https://neurovlm.github.io/neurovlm/" target="_blank" rel="noreferrer">NeuroVLM</a> has got you covered!</p>
-        <p class="methods"><b>Methods:</b> Each point is an abstract positioned in 2D from {embedding_label_html}, colored by <a href="https://link.springer.com/chapter/10.1007/978-3-642-37456-2_14" target="_blank" rel="noreferrer">HDBSCAN</a> cluster, and paired with a NeuroVLM-generated brainmap preview. Cluster names are derived from the titles within each cluster using an OpenAI model prompted to return short theme labels and to disambiguate duplicate names when needed. Hover to scan, click to hold a card open, and use the three filters to narrow the landscape.</p>
+        <p class="methods"><b>Methods:</b> Each point is an abstract positioned in 2D from {embedding_label_html}, colored by <a href="https://link.springer.com/chapter/10.1007/978-3-642-37456-2_14" target="_blank" rel="noreferrer">HDBSCAN</a> cluster, and paired with a NeuroVLM-generated brainmap preview. Cluster names are derived from all cluster title sets together using an OpenAI model prompted to return short, globally distinctive theme labels and to disambiguate duplicate names when needed. Hover to scan, click to hold a card open, and use the three filters to narrow the landscape.</p>
         <div class="chips" id="summary"></div>
         <div class="controls">
           <div class="search-field">
