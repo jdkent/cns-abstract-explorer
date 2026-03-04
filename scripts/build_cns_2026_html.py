@@ -606,6 +606,30 @@ def build_graph_html(
       text-decoration-thickness: 1px;
       text-underline-offset: 2px;
     }}
+    .source-link {{
+      margin: 12px 0 0;
+    }}
+    .source-link a {{
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      color: var(--ink);
+      font-weight: 700;
+      text-decoration: none;
+      background: rgba(31, 31, 31, 0.05);
+      border: 1px solid rgba(31, 31, 31, 0.08);
+    }}
+    .source-link a:hover {{
+      background: rgba(31, 31, 31, 0.08);
+    }}
+    .source-link svg {{
+      width: 18px;
+      height: 18px;
+      fill: currentColor;
+      flex: none;
+    }}
     @media (max-width: 980px) {{
       .shell {{
         width: min(100vw - 16px, 1380px);
@@ -658,6 +682,7 @@ def build_graph_html(
         </div>
         <p class="help">Faint links connect nearest semantic neighbors in the UMAP layout. <strong>Uncategorized</strong> marks abstracts that HDBSCAN did not assign to a stable cluster.</p>
         <p class="reference-note">Reference: brainmap previews are generated with <a href="https://neurovlm.github.io/neurovlm/" target="_blank" rel="noreferrer">NeuroVLM</a>.</p>
+        <p class="source-link"><a href="https://github.com/jdkent/cns-abstract-explorer" target="_blank" rel="noreferrer"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.5-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.5 7.5 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg><span>Check out the source code here!</span></a></p>
       </div>
       <div class="chart-wrap">
         <div class="zoom-toolbar" aria-label="Graph zoom controls">
