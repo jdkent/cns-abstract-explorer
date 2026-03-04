@@ -444,7 +444,8 @@ def build_graph_html(
       border-radius: 18px;
       padding: 16px;
       background: rgba(31, 31, 31, 0.04);
-      min-height: 260px;
+      height: min(72vh, 760px);
+      overflow-y: auto;
     }}
     .detail-meta {{
       margin: 0 0 8px;
@@ -484,6 +485,71 @@ def build_graph_html(
       color: #2c2c2c;
       max-height: 240px;
       overflow: auto;
+    }}
+    .detail-empty {{
+      display: grid;
+      gap: 14px;
+    }}
+    .detail-empty-art {{
+      display: grid;
+      gap: 14px;
+      margin-top: 4px;
+    }}
+    .skeleton-line {{
+      display: block;
+      height: 10px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, rgba(31, 31, 31, 0.06), rgba(31, 31, 31, 0.12), rgba(31, 31, 31, 0.06));
+    }}
+    .skeleton-line-lg {{ height: 14px; }}
+    .w-92 {{ width: 92%; }}
+    .w-86 {{ width: 86%; }}
+    .w-74 {{ width: 74%; }}
+    .w-68 {{ width: 68%; }}
+    .w-58 {{ width: 58%; }}
+    .detail-empty-topic {{
+      width: 42%;
+      height: 12px;
+      border-radius: 999px;
+      background: rgba(159, 58, 34, 0.16);
+    }}
+    .detail-empty-figure {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      padding: 16px;
+      border-radius: 16px;
+      min-height: 148px;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.58), rgba(255, 255, 255, 0.28)),
+        rgba(31, 31, 31, 0.035);
+      border: 1px solid rgba(31, 31, 31, 0.06);
+    }}
+    .detail-empty-blob {{
+      align-self: center;
+      justify-self: center;
+      width: clamp(64px, 26vw, 92px);
+      aspect-ratio: 1 / 1;
+      border-radius: 38% 44% 40% 46%;
+      background:
+        radial-gradient(circle at 38% 36%, rgba(196, 69, 40, 0.22), transparent 22%),
+        radial-gradient(circle at 64% 58%, rgba(31, 78, 121, 0.12), transparent 24%),
+        linear-gradient(180deg, rgba(255,255,255,0.85), rgba(225, 229, 235, 0.95));
+      border: 1px solid rgba(31, 31, 31, 0.08);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
+      opacity: 0.9;
+    }}
+    .detail-empty-blob:nth-child(2) {{
+      border-radius: 46% 34% 44% 40%;
+      width: clamp(66px, 28vw, 98px);
+    }}
+    .detail-empty-blob:nth-child(3) {{
+      border-radius: 50%;
+      width: clamp(68px, 29vw, 100px);
+    }}
+    .detail-empty-lines {{
+      display: grid;
+      gap: 10px;
     }}
     .tooltip {{
       position: absolute;
@@ -558,7 +624,7 @@ def build_graph_html(
         min-height: 42px;
       }}
       .detail {{ padding: 16px 16px 18px; }}
-      .detail-card {{ min-height: 0; }}
+      .detail-card {{ height: min(60vh, 680px); }}
       .legend {{ padding: 12px 16px 16px; }}
       .legend-scroll {{ max-height: 240px; }}
       .tooltip {{ display: none; }}
@@ -606,10 +672,7 @@ def build_graph_html(
     <aside class="card">
       <div class="detail">
         <h2>Selected abstract</h2>
-        <div class="detail-card" id="detail-card">
-          <p class="detail-meta">Nothing selected yet</p>
-          <p class="detail-abstract">Hover or click a node to inspect its poster number, title, topic area, and generated brainmap.</p>
-        </div>
+        <div class="detail-card" id="detail-card"></div>
       </div>
       <div class="legend">
         <h2>Cluster legend</h2>
@@ -703,12 +766,37 @@ def build_graph_html(
       }});
     }}
 
+    function emptyDetailMarkup() {{
+      return `
+        <div class="detail-empty">
+          <div>
+            <p class="detail-meta">Nothing selected yet</p>
+            <p class="detail-abstract">Hover or click a node to inspect its poster number, title, topic area, and generated brainmap.</p>
+          </div>
+          <div class="detail-empty-art" aria-hidden="true">
+            <span class="skeleton-line skeleton-line-lg w-92"></span>
+            <span class="skeleton-line skeleton-line-lg w-74"></span>
+            <span class="skeleton-line w-58"></span>
+            <div class="detail-empty-topic"></div>
+            <div class="detail-empty-figure">
+              <span class="detail-empty-blob"></span>
+              <span class="detail-empty-blob"></span>
+              <span class="detail-empty-blob"></span>
+            </div>
+            <div class="detail-empty-lines">
+              <span class="skeleton-line w-92"></span>
+              <span class="skeleton-line w-86"></span>
+              <span class="skeleton-line w-92"></span>
+              <span class="skeleton-line w-68"></span>
+            </div>
+          </div>
+        </div>
+      `;
+    }}
+
     function updateDetail(node) {{
       if (!node) {{
-        detailCard.innerHTML = `
-          <p class="detail-meta">Nothing selected yet</p>
-          <p class="detail-abstract">Hover or click a node to inspect its poster number, title, topic area, and generated brainmap.</p>
-        `;
+        detailCard.innerHTML = emptyDetailMarkup();
         return;
       }}
       detailCard.innerHTML = `
@@ -940,6 +1028,7 @@ def build_graph_html(
     drawSummary();
     drawLegend();
     updateLegendSelection();
+    updateDetail(null);
     applyViewBox();
     render();
   </script>
