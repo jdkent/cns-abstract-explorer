@@ -16,7 +16,7 @@ Treat this directory as the project root for the CNS 2026 abstract map.
 Install `neurovlm` directly from GitHub into the shared repo `.venv`:
 
 ```bash
-uv pip install --python ../.venv/bin/python git+https://github.com/neurovlm/neurovlm.git
+uv pip install git+https://github.com/neurovlm/neurovlm.git
 ```
 
 The full pipeline prefers the installed package first and only falls back to a local source checkout if the package is not available.
